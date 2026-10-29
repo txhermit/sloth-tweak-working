@@ -24,139 +24,28 @@
 
 void privdrop_resolve(const privdrop_req_t *req, privdrop_plan_t *plan) {
     memset(plan, 0, sizeof(*plan));
-    /* NNP is unconditional: it costs sloth nothing (it never execs a
-     * setuid helper) and closes the one route back up — an exec that
-     * regains privilege through file capabilities or the setuid bit. */
-    plan->set_no_new_privs = 1;
-    /* CAP_NET_RAW is never kept. pcap_activate() creates the AF_PACKET
-     * sockets at open and reading them needs no capability; the one
-     * consumer that would reopen, the interactive [m] retarget, is
-     * documented as needing a privileged run (see monitor-mode.md). */
-    plan->keep_net_raw = 0;
-    /* CAP_NET_ADMIN only for the two flags that write nl80211 for the
-     * whole run, and only if the process holds it — capset cannot
-     * grant a capability the permitted set lacks. */
-    int want_admin = req->hop || req->allow_active;
-    plan->keep_net_admin = want_admin && req->have_cap_net_admin;
-
-    if (req->user_given && req->no_privdrop) {
-        plan->action    = PRIVDROP_REFUSE_CANNOT;
-        plan->exit_code = 2;
-        plan->reason    = "--user and --no-privdrop contradict each other";
-        return;
-    }
-    if (req->user_given && !req->user_resolved) {
-        plan->action    = PRIVDROP_REFUSE_NO_SUCH_USER;
-        plan->exit_code = 2;
-        plan->reason    = "--user names no account on this host";
-        return;
-    }
-    if (req->no_privdrop) {
-        /* Nothing shed, so the plan describes what stays: everything. */
-        plan->action         = PRIVDROP_DISABLED;
-        plan->keep_net_admin = req->have_cap_net_admin;
-        plan->keep_net_raw   = req->have_cap_net_raw;
-        return;
-    }
-
-    int can_switch = req->user_resolved && req->have_cap_setuid;
-    if (req->user_given && !can_switch) {
-        /* Asked for by name and impossible: a refusal, never a quiet
-         * fallback to whatever uid the process already has. */
-        plan->action    = PRIVDROP_REFUSE_CANNOT;
-        plan->exit_code = 2;
-        plan->reason    = "--user needs root (CAP_SETUID and CAP_SETGID) "
-                          "to switch accounts";
-        return;
-    }
-
-    plan->shed_caps     = 1;
-    plan->drop_bounding = req->have_cap_setpcap;
-
-    if (req->euid_is_root) {
-        if (can_switch && req->uid != 0) {
-            plan->action     = PRIVDROP_DROP;
-            plan->change_uid = 1;
-            plan->uid        = req->uid;
-            plan->gid        = req->gid;
-        } else {
-            /* No account to drop to (or it is uid 0 itself): keep the
-             * uid, shed the capabilities. Root without CAP_DAC_OVERRIDE
-             * and friends is still owner of root's files, but no longer
-             * everyone's. */
-            plan->action = PRIVDROP_ROOT_KEEP_UID;
-        }
-        return;
-    }
-
-    if (req->user_given) {
-        /* Not root but holding CAP_SETUID/CAP_SETGID (can_switch held
-         * above) — an explicit request is honoured. */
-        plan->action     = PRIVDROP_DROP;
-        plan->change_uid = 1;
-        plan->uid        = req->uid;
-        plan->gid        = req->gid;
-        return;
-    }
-    /* A non-root run never switches to the default account on its own:
-     * the operator already chose the identity by starting it. */
-    plan->action = PRIVDROP_NONE_UNPRIVILEGED;
-}
-
-/* "CAP_NET_ADMIN for --hop" / "... for --hop and --allow-active". */
-static void kept_text(const privdrop_req_t *req, const privdrop_plan_t *plan,
-                      char *buf, size_t sz) {
-    if (plan->keep_net_admin)
-        snprintf(buf, sz, "CAP_NET_ADMIN for %s",
-                 req->hop && req->allow_active ? "--hop and --allow-active"
-                 : req->hop                    ? "--hop"
-                                               : "--allow-active");
-    else
-        snprintf(buf, sz, "none");
+    /* FORK TWEAK (txhermit sloth-tweak, 2026-10-28): privdrop is dead in
+     * this fork. The operator runs sloth under sudo and keeps the
+     * privileges it was started with for the whole run, so interfaces or
+     * helpers that come up late never trip over a service account, a
+     * capability shed, or no_new_privs. --user and --no-privdrop are
+     * still parsed in main (existing command lines keep working) and
+     * are ignored here: the plan is always DISABLED — nothing shed,
+     * nothing switched, no account consulted, no refusal. */
+    plan->action         = PRIVDROP_DISABLED;
+    plan->keep_net_admin = req->have_cap_net_admin;
+    plan->keep_net_raw   = req->have_cap_net_raw;
+    /* set_no_new_privs, shed_caps, change_uid, drop_bounding, exit_code
+     * and reason all stay 0/NULL from the memset: nothing is performed
+     * and nothing is refused. */
 }
 
 void privdrop_describe(const privdrop_req_t *req, const privdrop_plan_t *plan,
                        const char *user, char *buf, size_t sz) {
-    if (sz == 0) return;
-    buf[0] = '\0';
-    char kept[64];
-    kept_text(req, plan, kept, sizeof(kept));
-    if (!user) user = PRIVDROP_DEFAULT_USER;
-
-    switch (plan->action) {
-    case PRIVDROP_DROP:
-        snprintf(buf, sz,
-                 "sloth: dropped to uid %lu (%s) after capture opened; "
-                 "caps kept: %s; no_new_privs on",
-                 (unsigned long)plan->uid, user, kept);
-        break;
-    case PRIVDROP_ROOT_KEEP_UID:
-        snprintf(buf, sz,
-                 "sloth: no '%s' account to drop to — staying uid 0 with "
-                 "every capability dropped; caps kept: %s; no_new_privs on. "
-                 "Create the account (packaging/systemd/sloth.sysusers.conf) "
-                 "or pass --user NAME",
-                 user, kept);
-        break;
-    case PRIVDROP_DISABLED:
-        snprintf(buf, sz,
-                 "sloth: --no-privdrop: privileges NOT dropped — this run "
-                 "keeps %s for its whole life",
-                 req->euid_is_root ? "uid 0 and every capability"
-                                   : "every capability it was started with");
-        break;
-    case PRIVDROP_NONE_UNPRIVILEGED:
-        /* Said only when there was something to shed; an ordinary
-         * unprivileged dev run prints nothing. */
-        if (req->have_cap_net_raw || req->have_cap_net_admin)
-            snprintf(buf, sz,
-                     "sloth: capabilities dropped after capture opened; "
-                     "caps kept: %s; no_new_privs on", kept);
-        break;
-    case PRIVDROP_REFUSE_NO_SUCH_USER:
-    case PRIVDROP_REFUSE_CANNOT:
-        break;
-    }
+    /* FORK TWEAK: privdrop is dead (see privdrop_resolve), so there is
+     * no drop to announce. Always silent. */
+    (void)req; (void)plan; (void)user;
+    if (sz) buf[0] = '\0';
 }
 
 /* ── Apply (syscalls) ────────────────────────────────────── */

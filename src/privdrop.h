@@ -25,7 +25,15 @@
  * when it exists (or --user NAME), keeping CAP_NET_ADMIN only for --hop
  * or --allow-active. With no such account it keeps uid 0 but still sheds
  * every capability it does not need, and says so — it never silently
- * stays fully root. --no-privdrop is the explicit, announced escape. */
+ * stays fully root. --no-privdrop is the explicit, announced escape.
+ *
+ * FORK TWEAK (txhermit sloth-tweak, 2026-10-28): the drop is DISABLED in
+ * this fork, by the fork owner's ruling. privdrop_resolve() always
+ * returns PRIVDROP_DISABLED and privdrop_describe() is always silent:
+ * a run keeps the uid and capabilities it was started with (the
+ * operator runs sloth under sudo on purpose). The plan/apply machinery
+ * below is retained, inert, so the module's shape — and main's call
+ * sites — are unchanged. */
 
 typedef struct {
     /* Probed from the process (privdrop_probe()). */
