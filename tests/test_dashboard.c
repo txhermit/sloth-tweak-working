@@ -264,9 +264,9 @@ static void test_draw_with_monitor_error(void) {
     sloth_state_t s; memset(&s, 0, sizeof(s));
     seed_iface(&s, "eth0");
     snprintf(s.probe_err, sizeof(s.probe_err),
-             "no monitor-mode iface found (need type 803)");
+             "no monitor-mode iface found");
     view_dashboard_draw(&s);
-    ASSERT_SCREEN_HAS("no monitor-mode iface found (need type 803)");
+    ASSERT_SCREEN_HAS("no monitor-mode iface found");
 }
 
 /* ── iface hide election (shared with iface view) ────────── */

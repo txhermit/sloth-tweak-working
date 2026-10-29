@@ -36,6 +36,9 @@
 #include "ctrl_frames.h"
 #include "mle.h"
 #include "ble_hci.h"              /* raw HCI device refusal (#144 slice 2) */
+#if defined(PLATFORM_LINUX) && defined(WITH_WIFI)
+#include "platform/linux_wifi.h"  /* nl80211 iftype fallback (fork tweak) */
+#endif
 
 #ifdef PLATFORM_LINUX
 #  include <dirent.h>
@@ -168,7 +171,23 @@ static int find_monitor_iface(char *buf, int sz) {
         FILE *f = fopen(path, "r");
         if (!f) continue;
         int type = 0;
-        if (fscanf(f, "%d", &type) == 1 && type == 803) { /* ARPHRD_IEEE80211_RADIOTAP */
+        int is_mon = 0;
+        if (fscanf(f, "%d", &type) == 1) {
+            /* 803 = ARPHRD_IEEE80211_RADIOTAP, 804 = ..._PRISM (the
+             * platform list in platform/linux.c counts both). */
+            is_mon = (type == 803 || type == 804);
+#if defined(WITH_WIFI)
+            /* FORK TWEAK (txhermit sloth-tweak, 2026-10-28): some
+             * drivers register a monitor interface as 801
+             * (ARPHRD_IEEE80211) in sysfs while nl80211 reports it
+             * as monitor. When sysfs says 801, ask nl80211 — the
+             * authoritative source, and the one `iw dev` reads. */
+            if (!is_mon && type == 801 &&
+                linux_wifi_iface_is_monitor(e->d_name) == 1)
+                is_mon = 1;
+#endif
+        }
+        if (is_mon) {
             fclose(f);
             snprintf(buf, sz, "%s", e->d_name);
             closedir(d);
@@ -870,42 +889,65 @@ int probe_test_dispatch(sloth_state_t *s,
 
 /* ── Public API ──────────────────────────────────────────── */
 
-void probe_open(sloth_state_t *s) {
-    g_state = s;
-    s->probe_err[0] = '\0';
-
-    char iface[16] = "";
-    if (!find_monitor_iface(iface, sizeof(iface))) {
-        snprintf(s->probe_err, sizeof(s->probe_err),
-                 "no monitor-mode iface found (need type 803)");
-        return;
-    }
-
+/* Open `iface` as the monitor capture and adopt it as
+ * s->probe_iface when its datalink is radiotap — the ground-truth
+ * test that the interface really delivers monitor frames, whatever
+ * any discovery heuristic believed. On failure s->probe_err says
+ * why and no handle is kept. */
+static int probe_try_open(sloth_state_t *s, const char *iface) {
     /* find_monitor_iface() walks netdevs, which a Bluetooth controller
      * is not; checked anyway so no open path is without it (#144). */
     if (bt_dev_is_raw_hci(iface)) {
         snprintf(s->probe_err, sizeof(s->probe_err),
                  "%.15s refused: raw HCI device", iface);
-        return;
+        return 0;
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
-    g_ph = pcap_open_live(iface, 65535, 1, 100, errbuf);
-    if (!g_ph) {
-        snprintf(s->probe_err, sizeof(s->probe_err), "pcap(%s): %.50s", iface, errbuf);
-        return;
+    pcap_t *ph = pcap_open_live(iface, 65535, 1, 100, errbuf);
+    if (!ph) {
+        snprintf(s->probe_err, sizeof(s->probe_err),
+                 "pcap(%s): %.50s", iface, errbuf);
+        return 0;
     }
 
-    int dlt = pcap_datalink(g_ph);
+    int dlt = pcap_datalink(ph);
     if (dlt != DLT_IEEE802_11_RADIO) {
-        pcap_close(g_ph);
-        g_ph = NULL;
+        pcap_close(ph);
         snprintf(s->probe_err, sizeof(s->probe_err),
                  "%s: DLT %d not radiotap", iface, dlt);
+        return 0;
+    }
+
+    g_ph = ph;
+    s->probe_err[0] = '\0';
+    snprintf(s->probe_iface, sizeof(s->probe_iface), "%s", iface);
+    return 1;
+}
+
+void probe_open(sloth_state_t *s) {
+    g_state = s;
+    s->probe_err[0] = '\0';
+
+    /* FORK TWEAK (txhermit sloth-tweak, 2026-10-28): an interface the
+     * operator named with --iface is tried first. Upstream discovered
+     * a monitor interface on its own and ignored the name for this
+     * decision, so `--iface <monitor> --monitor-only` refused to run
+     * whenever auto-discovery missed the named radio. The radiotap
+     * datalink check in probe_try_open() is the validation: a named
+     * non-monitor interface fails it and discovery proceeds. */
+    for (int i = 0; i < s->iface_allowed_count; i++)
+        if (probe_try_open(s, s->iface_allowed[i])) return;
+
+    char iface[16] = "";
+    if (!find_monitor_iface(iface, sizeof(iface))) {
+        if (!s->probe_err[0])
+            snprintf(s->probe_err, sizeof(s->probe_err),
+                     "no monitor-mode iface found");
         return;
     }
 
-    snprintf(s->probe_iface, sizeof(s->probe_iface), "%s", iface);
+    probe_try_open(s, iface);
 }
 
 void probe_run(void) {

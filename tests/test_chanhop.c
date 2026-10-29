@@ -6,6 +6,8 @@
 
 #if defined(PLATFORM_LINUX) && defined(WITH_WIFI)
 #include <linux/netlink.h>
+#include <linux/genetlink.h>
+#include <linux/nl80211.h>
 #include "platform/linux_wifi.h"
 #endif
 
@@ -711,6 +713,61 @@ static void test_ack_result_rejects_malformed(void) {
     n = build_ack(b, sizeof(b), 5, NLMSG_ERROR, 0);
     ASSERT_EQ(linux_wifi_ack_result(b, n), -EIO);             /* positive: not an errno */
 }
+
+/* ── GET_INTERFACE iftype query (fork tweak) ──
+ * Hand-built replies, in the build_ack style: the parser half of the
+ * nl80211 monitor check that capture/probe.c discovery falls back to
+ * when sysfs reports a monitor interface as type 801. */
+static long build_iface_reply(uint8_t *buf, size_t cap, uint32_t iftype,
+                              int with_attr) {
+    size_t need = NLMSG_HDRLEN + GENL_HDRLEN + (with_attr ? 8u : 0u);
+    if (cap < need) return -1;
+    memset(buf, 0, need);
+    struct nlmsghdr *h = (struct nlmsghdr *)buf;
+    h->nlmsg_len  = (uint32_t)need;
+    h->nlmsg_type = 42;   /* a family id: anything but NLMSG_ERROR */
+    struct genlmsghdr *gh = (struct genlmsghdr *)NLMSG_DATA(h);
+    gh->cmd = NL80211_CMD_NEW_INTERFACE;
+    if (with_attr) {
+        struct nlattr *na = (struct nlattr *)((char *)gh + GENL_HDRLEN);
+        na->nla_type = NL80211_ATTR_IFTYPE;
+        na->nla_len  = 8;
+        memcpy((char *)na + 4, &iftype, sizeof(iftype));
+    }
+    return (long)need;
+}
+
+static void test_iface_is_monitor_parser(void) {
+    uint8_t b[128];
+    long n = build_iface_reply(b, sizeof(b), NL80211_IFTYPE_MONITOR, 1);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(b, n), 1);
+    n = build_iface_reply(b, sizeof(b), NL80211_IFTYPE_STATION, 1);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(b, n), 0);
+    /* No IFTYPE attribute: the query is unanswered, not "not monitor". */
+    n = build_iface_reply(b, sizeof(b), NL80211_IFTYPE_MONITOR, 0);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(b, n), -1);
+    /* A kernel error reply is unanswered too. */
+    n = build_ack(b, sizeof(b), -ENODEV, NLMSG_ERROR, 0);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(b, n), -1);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(NULL, 64), -1);
+    n = build_iface_reply(b, sizeof(b), NL80211_IFTYPE_MONITOR, 1);
+    ASSERT_EQ(linux_wifi_parse_iface_is_monitor(b, n - 1), -1);
+}
+
+static void test_prepare_get_interface(void) {
+    uint8_t b[64];
+    size_t n = linux_wifi_prepare_get_interface(b, sizeof(b), 42, 3);
+    ASSERT(n > 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)b;
+    ASSERT_EQ(h->nlmsg_len, (uint32_t)n);
+    struct genlmsghdr *gh = (struct genlmsghdr *)NLMSG_DATA(h);
+    ASSERT_EQ(gh->cmd, NL80211_CMD_GET_INTERFACE);
+    struct nlattr *na = (struct nlattr *)((char *)gh + GENL_HDRLEN);
+    ASSERT_EQ(na->nla_type, NL80211_ATTR_IFINDEX);
+    ASSERT_EQ(linux_wifi_prepare_get_interface(b, sizeof(b), 42, 0), 0);
+    ASSERT_EQ(linux_wifi_prepare_get_interface(NULL, 64, 42, 3), 0);
+    ASSERT_EQ(linux_wifi_prepare_get_interface(b, 8, 42, 3), 0);
+}
 #endif
 
 void run_chanhop_tests(void) {
@@ -761,5 +818,7 @@ void run_chanhop_tests(void) {
 #if defined(PLATFORM_LINUX) && defined(WITH_WIFI)
     RUN_TEST(test_ack_result_carries_kernel_errno);
     RUN_TEST(test_ack_result_rejects_malformed);
+    RUN_TEST(test_iface_is_monitor_parser);
+    RUN_TEST(test_prepare_get_interface);
 #endif
 }

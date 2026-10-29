@@ -49,6 +49,22 @@ int linux_wifi_set_channel(const char *iface, int freq_mhz);
    hand-built bytes and no socket (#91). */
 int linux_wifi_ack_result(const void *buf, long len);
 
+/* ── Interface-type query (fork tweak) ──
+ *
+ * FORK TWEAK (txhermit sloth-tweak, 2026-10-28): the sysfs ARPHRD
+ * type a driver registers for a monitor interface is not reliable
+ * (801 where nl80211 says monitor), so probe discovery can ask the
+ * kernel directly. linux_wifi_iface_is_monitor() returns 1 when
+ * nl80211 reports NL80211_IFTYPE_MONITOR for the named interface, 0
+ * when it reports any other type, and -1 when the query could not be
+ * answered. Read-only: it changes no kernel state. The builder and
+ * the reply parser are split out pure, in the style of the scan
+ * trigger below, so both are testable without a radio. */
+size_t linux_wifi_prepare_get_interface(uint8_t *buf, size_t sz, int family,
+                                        unsigned ifidx);
+int linux_wifi_parse_iface_is_monitor(const void *buf, long len);
+int linux_wifi_iface_is_monitor(const char *iface);
+
 /* ── Scan-trigger policy, limiter and instrumentation (#84) ──
  *
  * linux_wifi_scan() reads cached results, but it also used to kick a

@@ -640,6 +640,87 @@ int linux_wifi_ack_result(const void *buf, long len) {
     return -EIO;
 }
 
+/* ── Interface-type query (fork tweak) ─────────────────────
+ *
+ * FORK TWEAK (txhermit sloth-tweak, 2026-10-28): monitor-mode
+ * detection in capture/probe.c keys on the /sys/class/net/<if>/type
+ * ARPHRD value, but drivers disagree with nl80211 there — a monitor
+ * interface can register 801 (ARPHRD_IEEE80211) in sysfs instead of
+ * 803 (RADIOTAP) while `iw dev` correctly reports "type monitor".
+ * This query asks the authoritative source. Read-only:
+ * NL80211_CMD_GET_INTERFACE changes no kernel state. */
+
+size_t linux_wifi_prepare_get_interface(uint8_t *buf, size_t sz, int family,
+                                        unsigned ifidx) {
+    const size_t msg_sz = NLMSG_HDRLEN + GENL_HDRLEN
+                        + NA_ALIGN(NA_HDRLEN + sizeof(uint32_t));
+    if (!buf || sz < msg_sz || ifidx == 0 || family < 0) return 0;
+    memset(buf, 0, msg_sz);
+    struct nlmsghdr  *nlh = (struct nlmsghdr *)buf;
+    struct genlmsghdr *gh = (struct genlmsghdr *)NLMSG_DATA(nlh);
+    struct nlattr     *na = (struct nlattr *)((char *)gh + GENL_HDRLEN);
+    nlh->nlmsg_len   = (uint32_t)msg_sz;
+    nlh->nlmsg_type  = (uint16_t)family;
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    nlh->nlmsg_seq   = 3;
+    gh->cmd          = NL80211_CMD_GET_INTERFACE;
+    na->nla_type     = NL80211_ATTR_IFINDEX;
+    na->nla_len      = (uint16_t)(NA_HDRLEN + sizeof(uint32_t));
+    *(uint32_t *)NA_DATA(na) = ifidx;
+    return msg_sz;
+}
+
+int linux_wifi_parse_iface_is_monitor(const void *buf, long len) {
+    if (!buf || len < (long)(NLMSG_HDRLEN + GENL_HDRLEN)) return -1;
+    const struct nlmsghdr *nlh = (const struct nlmsghdr *)buf;
+    if (nlh->nlmsg_type == NLMSG_ERROR) return -1;
+    if ((long)nlh->nlmsg_len > len) return -1;
+    const struct genlmsghdr *gh = (const struct genlmsghdr *)NLMSG_DATA(nlh);
+    int rem = (int)nlh->nlmsg_len - NLMSG_HDRLEN - GENL_HDRLEN;
+    struct nlattr *na = (struct nlattr *)((char *)gh + GENL_HDRLEN);
+    while (na_ok(na, rem)) {
+        if (NA_TYPE(na) == NL80211_ATTR_IFTYPE) {
+            if (na->nla_len < NA_HDRLEN + sizeof(uint32_t)) return -1;
+            uint32_t t = *(const uint32_t *)NA_DATA(na);
+            return t == NL80211_IFTYPE_MONITOR ? 1 : 0;
+        }
+        na = na_next(na, &rem);
+    }
+    return -1;
+}
+
+int linux_wifi_iface_is_monitor(const char *iface) {
+    if (!iface || !iface[0]) return -1;
+    unsigned ifidx = if_nametoindex(iface);
+    if (ifidx == 0) return -1;
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+    if (fd < 0) return -1;
+    /* A missing reply must not wedge startup. */
+    struct timeval tv = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int result = -1;
+    int family = get_nl80211_id(fd);
+    if (family >= 0) {
+        uint8_t sbuf[64];
+        size_t msg_sz = linux_wifi_prepare_get_interface(sbuf, sizeof(sbuf),
+                                                         family, ifidx);
+        if (msg_sz) {
+            struct sockaddr_nl sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.nl_family = AF_NETLINK;
+            if (sendto(fd, sbuf, msg_sz, 0,
+                       (struct sockaddr *)&sa, sizeof(sa)) >= 0) {
+                uint8_t rbuf[4096];
+                ssize_t r = recv(fd, rbuf, sizeof(rbuf), 0);
+                if (r > 0)
+                    result = linux_wifi_parse_iface_is_monitor(rbuf, (long)r);
+            }
+        }
+    }
+    close(fd);
+    return result;
+}
+
 int linux_wifi_set_channel(const char *iface, int freq_mhz) {
     if (!iface || !iface[0] || freq_mhz <= 0) return -EINVAL;
     unsigned ifidx = if_nametoindex(iface);
